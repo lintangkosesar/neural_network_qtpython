@@ -10,9 +10,5 @@ This project is implemented in Rust because of its high performance, memory safe
 5. Achieved accuracy: around 90-98%.
 ![alt text](https://github.com/lintangkosesar/neural_network_qt/blob/main/qt/build/training_plot.png?raw=true)
 6. This project also includes a Qt GUI to easily train the model and predict dummy data interactively.
-![alt text](https://github.com/lintangkosesar/neural_network_qt/blob/main/guiqt.png?raw=true)
-![alt text](https://github.com/lintangkosesar/neural_network_qt/blob/main/prediksibaik.png?raw=true)
-![alt text](https://github.com/lintangkosesar/neural_network_qt/blob/main/prediksisedang.png?raw=true)
-![alt text](https://github.com/lintangkosesar/neural_network_qt/blob/main/prediksitidaksehat.png?raw=true)
 
 Feel free to explore the code and the GUI interface! 🚀
