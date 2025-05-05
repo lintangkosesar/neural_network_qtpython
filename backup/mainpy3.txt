@@ -1,0 +1,606 @@
+import sys
+import os
+import csv
+import numpy as np
+import matplotlib
+matplotlib.use('Qt5Agg')
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                            QPushButton, QLineEdit, QLabel, QFileDialog, QMessageBox,
+                            QProgressBar, QGroupBox, QTabWidget)
+from PyQt5.QtGui import QValidator
+from PyQt5 import QtGui
+from PyQt5.QtCore import Qt, pyqtSignal, QThread
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from ctypes import CDLL, c_char_p, c_int, c_double, POINTER, Structure, c_float, CFUNCTYPE
+import tempfile
+import shutil
+import matplotlib.animation as animation
+from matplotlib.patches import Circle, Arrow
+
+# Load the Rust library
+lib_path = os.path.join(os.path.dirname(__file__), 'target/release/libairquality_predictor.so')
+rust_lib = CDLL(lib_path)
+
+# Define C structures to match Rust
+class PredictionResult(Structure):
+    _fields_ = [
+        ("predicted_class", c_int),
+        ("probabilities", POINTER(c_float)),
+        ("probabilities_len", c_int)
+    ]
+
+# Define callback type
+PROGRESS_CALLBACK = CFUNCTYPE(None, c_int, c_double, c_double)
+
+# Define function prototypes
+rust_lib.train_model_with_progress.argtypes = [
+    c_char_p,  # csv_path
+    c_int,     # epochs
+    c_char_p,  # plot_path
+    c_char_p,  # model_path
+    POINTER(c_double),  # accuracy
+    PROGRESS_CALLBACK   # callback
+]
+rust_lib.train_model_with_progress.restype = c_int
+
+rust_lib.predict_air_quality.argtypes = [
+    c_double,  # pm10
+    c_double,  # so2
+    c_double,  # co
+    c_double,  # o3
+    c_double,  # no2
+    c_char_p   # model_path
+]
+rust_lib.predict_air_quality.restype = POINTER(PredictionResult)
+
+rust_lib.free_prediction_result.argtypes = [POINTER(PredictionResult)]
+rust_lib.free_prediction_result.restype = None
+
+class TrainingThread(QThread):
+    update_progress = pyqtSignal(int, float, float)
+    training_complete = pyqtSignal(bool, float)
+    
+    def __init__(self, csv_path, epochs, learning_rate, parent=None):
+        super().__init__(parent)
+        self.csv_path = csv_path
+        self.epochs = epochs
+        self.learning_rate = learning_rate
+        self.running = True
+        
+    def progress_callback(self, epoch, accuracy, loss):
+        self.update_progress.emit(epoch, accuracy, loss)
+        print(f"Epoch {epoch}/{self.epochs} - Accuracy: {accuracy*100:.2f}%, Loss: {loss:.4f}")
+        
+    def run(self):
+        # Create paths in project directory
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        plot_path = os.path.join(project_dir, "training_plot.png")
+        model_path = os.path.join(project_dir, "trained_model.bin")
+        
+        accuracy = c_double(0.0)
+        
+        csv_path_bytes = self.csv_path.encode('utf-8')
+        plot_path_bytes = plot_path.encode('utf-8')
+        model_path_bytes = model_path.encode('utf-8')
+        
+        callback = PROGRESS_CALLBACK(self.progress_callback)
+        
+        success = rust_lib.train_model_with_progress(
+            csv_path_bytes,
+            self.epochs,
+            plot_path_bytes,
+            model_path_bytes,
+            accuracy,
+            callback
+        )
+        
+        if success:
+            self.training_complete.emit(True, accuracy.value)
+            self.plot_path = plot_path
+            self.model_path = model_path
+        else:
+            self.training_complete.emit(False, 0.0)
+            if os.path.exists(plot_path):
+                os.unlink(plot_path)
+            if os.path.exists(model_path):
+                os.unlink(model_path)
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        # Initialize model path first
+        self.model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trained_model.bin")
+        
+        self.setWindowTitle("Air Quality Predictor with Neural Network Visualization")
+        self.setGeometry(100, 100, 1400, 1000)
+        
+        self.main_widget = QWidget()
+        self.setCentralWidget(self.main_widget)
+        self.layout = QVBoxLayout(self.main_widget)
+        
+        self.csv_path = ""
+        self.data_count = 0
+        self.training_thread = None
+        self.plot_path = ""
+        self.epoch_data = []
+        self.accuracy_data = []
+        self.loss_data = []
+        self.animation = None
+        self.nn_weights = []
+        
+        self.create_data_loading_section()
+        self.create_training_parameters_section()
+        self.create_progress_section()
+        self.create_visualization_section()
+        self.create_prediction_section()
+        
+        # Enable predict button if model exists
+        self.predict_button.setEnabled(os.path.exists(self.model_path))
+    
+    def create_data_loading_section(self):
+        group = QGroupBox("Data Loading")
+        layout = QHBoxLayout()
+        
+        self.load_button = QPushButton("Load CSV")
+        self.load_button.clicked.connect(self.load_csv)
+        
+        self.csv_label = QLabel("No file selected")
+        self.data_count_label = QLabel("Data count: 0")
+        
+        layout.addWidget(self.load_button)
+        layout.addWidget(self.csv_label)
+        layout.addWidget(self.data_count_label)
+        layout.addStretch()
+        
+        group.setLayout(layout)
+        self.layout.addWidget(group)
+    
+    def create_training_parameters_section(self):
+        group = QGroupBox("Training Parameters")
+        layout = QHBoxLayout()
+        
+        epoch_layout = QVBoxLayout()
+        epoch_label = QLabel("Epochs:")
+        self.epoch_input = QLineEdit("100")
+        self.epoch_input.setValidator(QtGui.QIntValidator(1, 10000))
+        epoch_layout.addWidget(epoch_label)
+        epoch_layout.addWidget(self.epoch_input)
+        
+        lr_layout = QVBoxLayout()
+        lr_label = QLabel("Learning Rate:")
+        self.lr_input = QLineEdit("0.001")
+        self.lr_input.setValidator(QtGui.QDoubleValidator(0.0001, 1.0, 4))
+        lr_layout.addWidget(lr_label)
+        lr_layout.addWidget(self.lr_input)
+        
+        self.train_button = QPushButton("Train Model")
+        self.train_button.clicked.connect(self.start_training)
+        self.train_button.setEnabled(False)
+        
+        layout.addLayout(epoch_layout)
+        layout.addLayout(lr_layout)
+        layout.addWidget(self.train_button)
+        layout.addStretch()
+        
+        group.setLayout(layout)
+        self.layout.addWidget(group)
+    
+    def create_progress_section(self):
+        group = QGroupBox("Training Progress")
+        layout = QVBoxLayout()
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        
+        self.epoch_label = QLabel("Epoch: 0/0")
+        self.accuracy_label = QLabel("Accuracy: 0.0%")
+        self.loss_label = QLabel("Loss: 0.0")
+        
+        progress_layout = QHBoxLayout()
+        progress_layout.addWidget(self.epoch_label)
+        progress_layout.addWidget(self.accuracy_label)
+        progress_layout.addWidget(self.loss_label)
+        progress_layout.addStretch()
+        
+        layout.addWidget(self.progress_bar)
+        layout.addLayout(progress_layout)
+        
+        group.setLayout(layout)
+        self.layout.addWidget(group)
+    
+    def create_visualization_section(self):
+        group = QGroupBox("Neural Network Visualization")
+        layout = QVBoxLayout()
+        
+        self.tab_widget = QTabWidget()
+        
+        # Tab 1: Training Plots
+        self.plots_tab = QWidget()
+        self.plots_layout = QVBoxLayout(self.plots_tab)
+        
+        # Accuracy Plot
+        self.accuracy_figure = Figure(figsize=(8, 3), dpi=100)
+        self.accuracy_canvas = FigureCanvas(self.accuracy_figure)
+        self.accuracy_ax = self.accuracy_figure.add_subplot(111)
+        self.accuracy_ax.set_xlabel('Epoch')
+        self.accuracy_ax.set_ylabel('Accuracy')
+        self.accuracy_ax.grid(True)
+        self.accuracy_line, = self.accuracy_ax.plot([], [], 'r-')
+        
+        # Loss Plot
+        self.loss_figure = Figure(figsize=(8, 3), dpi=100)
+        self.loss_canvas = FigureCanvas(self.loss_figure)
+        self.loss_ax = self.loss_figure.add_subplot(111)
+        self.loss_ax.set_xlabel('Epoch')
+        self.loss_ax.set_ylabel('Loss')
+        self.loss_ax.grid(True)
+        self.loss_line, = self.loss_ax.plot([], [], 'b-')
+        
+        self.plots_layout.addWidget(self.accuracy_canvas)
+        self.plots_layout.addWidget(self.loss_canvas)
+        
+        # Tab 2: Neural Network Architecture
+        self.nn_tab = QWidget()
+        self.nn_layout = QVBoxLayout(self.nn_tab)
+        
+        self.nn_figure = Figure(figsize=(10, 6), dpi=100)
+        self.nn_canvas = FigureCanvas(self.nn_figure)
+        self.nn_ax = self.nn_figure.add_subplot(111)
+        self.nn_ax.axis('off')
+        self.nn_layout.addWidget(self.nn_canvas)
+        
+        # Add tabs
+        self.tab_widget.addTab(self.plots_tab, "Training Progress")
+        self.tab_widget.addTab(self.nn_tab, "Network Architecture")
+        
+        layout.addWidget(self.tab_widget)
+        group.setLayout(layout)
+        self.layout.addWidget(group)
+        
+        # Initialize NN visualization
+        self.draw_neural_net()
+    
+    def draw_neural_net(self, weights=None):
+        self.nn_ax.clear()
+        self.nn_ax.axis('off')
+        
+        # Network parameters
+        layer_sizes = [5, 10, 10, 10, 3]  # Input, Hidden1, Hidden2, Hidden3, Output
+        layer_colors = ['skyblue', 'lightgreen', 'lightgreen', 'lightgreen', 'salmon']
+        
+        # Calculate positions
+        v_spacing = 1.0 / float(max(layer_sizes))
+        h_spacing = 1.0 / float(len(layer_sizes) - 1)
+        
+        # Draw nodes
+        for i, (n_nodes, color) in enumerate(zip(layer_sizes, layer_colors)):
+            layer_top = v_spacing * (n_nodes - 1) / 2. + 0.5
+            for j in range(n_nodes):
+                circle = Circle((i * h_spacing, layer_top - j * v_spacing), 
+                               v_spacing / 4.0, 
+                               color=color, 
+                               ec='k', 
+                               zorder=4)
+                self.nn_ax.add_patch(circle)
+                
+                # Add text for input/output labels
+                if i == 0:
+                    inputs = ['PM10', 'SO2', 'CO', 'O3', 'NO2']
+                    self.nn_ax.text(i * h_spacing - 0.05, 
+                                   layer_top - j * v_spacing, 
+                                   inputs[j], 
+                                   ha='right', 
+                                   va='center')
+                elif i == len(layer_sizes) - 1:
+                    outputs = ['BAIK', 'SEDANG', 'TIDAK SEHAT']
+                    self.nn_ax.text(i * h_spacing + 0.05, 
+                                   layer_top - j * v_spacing, 
+                                   outputs[j], 
+                                   ha='left', 
+                                   va='center')
+        
+        # Draw connections with weights
+        if weights is not None and len(weights) == len(layer_sizes)-1:
+            for i, (n_nodes, next_nodes) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
+                layer_top = v_spacing * (n_nodes - 1) / 2. + 0.5
+                next_layer_top = v_spacing * (next_nodes - 1) / 2. + 0.5
+                
+                for j in range(n_nodes):
+                    for k in range(next_nodes):
+                        weight = weights[i][j][k]
+                        linewidth = abs(weight) * 2.0
+                        alpha = min(0.8, abs(weight))
+                        color = 'green' if weight > 0 else 'red'
+                        
+                        line = Arrow(i * h_spacing, 
+                                    layer_top - j * v_spacing,
+                                    (i + 1) * h_spacing - i * h_spacing,
+                                    (next_layer_top - k * v_spacing) - (layer_top - j * v_spacing),
+                                    width=linewidth/100.0,
+                                    color=color,
+                                    alpha=alpha)
+                        self.nn_ax.add_patch(line)
+        
+        self.nn_canvas.draw()
+    
+    def animate_nn(self, i):
+        if i < len(self.nn_weights):
+            self.draw_neural_net(self.nn_weights[i])
+        return []
+    
+    def create_prediction_section(self):
+        group = QGroupBox("Prediction")
+        layout = QVBoxLayout()
+        
+        input_layout = QHBoxLayout()
+        
+        self.pm10_input = QLineEdit()
+        self.pm10_input.setPlaceholderText("PM10")
+        self.so2_input = QLineEdit()
+        self.so2_input.setPlaceholderText("SO2")
+        self.co_input = QLineEdit()
+        self.co_input.setPlaceholderText("CO")
+        self.o3_input = QLineEdit()
+        self.o3_input.setPlaceholderText("O3")
+        self.no2_input = QLineEdit()
+        self.no2_input.setPlaceholderText("NO2")
+        
+        input_layout.addWidget(QLabel("PM10:"))
+        input_layout.addWidget(self.pm10_input)
+        input_layout.addWidget(QLabel("SO2:"))
+        input_layout.addWidget(self.so2_input)
+        input_layout.addWidget(QLabel("CO:"))
+        input_layout.addWidget(self.co_input)
+        input_layout.addWidget(QLabel("O3:"))
+        input_layout.addWidget(self.o3_input)
+        input_layout.addWidget(QLabel("NO2:"))
+        input_layout.addWidget(self.no2_input)
+        
+        predict_layout = QHBoxLayout()
+        self.predict_button = QPushButton("Predict")
+        self.predict_button.clicked.connect(self.predict)
+        
+        self.prediction_result = QLabel("Prediction: -")
+        self.probabilities_label = QLabel("Probabilities: -")
+        
+        predict_layout.addWidget(self.predict_button)
+        predict_layout.addWidget(self.prediction_result)
+        predict_layout.addWidget(self.probabilities_label)
+        predict_layout.addStretch()
+        
+        layout.addLayout(input_layout)
+        layout.addLayout(predict_layout)
+        
+        group.setLayout(layout)
+        self.layout.addWidget(group)
+    
+    def load_csv(self):
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "Open CSV File", "", "CSV Files (*.csv)", options=options)
+        
+        if file_name:
+            self.csv_path = file_name
+            self.csv_label.setText(os.path.basename(file_name))
+            
+            try:
+                with open(file_name, 'r') as f:
+                    reader = csv.reader(f)
+                    self.data_count = sum(1 for row in reader) - 1
+                    self.data_count_label.setText(f"Data count: {self.data_count}")
+                    
+                    if self.data_count > 0:
+                        self.train_button.setEnabled(True)
+                    else:
+                        QMessageBox.warning(self, "Warning", "The selected CSV file has no data rows.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to read CSV file: {str(e)}")
+    
+    def start_training(self):
+        if not self.csv_path:
+            QMessageBox.warning(self, "Warning", "Please load a CSV file first.")
+            return
+        
+        try:
+            epochs = int(self.epoch_input.text())
+            learning_rate = float(self.lr_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Please enter valid numbers for epochs and learning rate.")
+            return
+        
+        # Reset animation if running
+        if self.animation is not None:
+            self.animation.event_source.stop()
+            self.animation = None
+        
+        self.progress_bar.setValue(0)
+        self.epoch_label.setText(f"Epoch: 0/{epochs}")
+        self.accuracy_label.setText("Accuracy: 0.0%")
+        self.loss_label.setText("Loss: 0.0")
+        
+        self.epoch_data = []
+        self.accuracy_data = []
+        self.loss_data = []
+        self.nn_weights = []
+        
+        # Reset plots
+        self.accuracy_ax.clear()
+        self.accuracy_line, = self.accuracy_ax.plot([], [], 'r-')
+        self.accuracy_ax.set_xlabel('Epoch')
+        self.accuracy_ax.set_ylabel('Accuracy')
+        self.accuracy_ax.grid(True)
+        
+        self.loss_ax.clear()
+        self.loss_line, = self.loss_ax.plot([], [], 'b-')
+        self.loss_ax.set_xlabel('Epoch')
+        self.loss_ax.set_ylabel('Loss')
+        self.loss_ax.grid(True)
+        
+        self.accuracy_canvas.draw()
+        self.loss_canvas.draw()
+        
+        # Reset NN visualization
+        self.draw_neural_net()
+        
+        self.load_button.setEnabled(False)
+        self.train_button.setEnabled(False)
+        
+        self.training_thread = TrainingThread(self.csv_path, epochs, learning_rate)
+        self.training_thread.update_progress.connect(self.update_training_progress)
+        self.training_thread.training_complete.connect(self.training_finished)
+        self.training_thread.start()
+    
+    def update_training_progress(self, epoch, accuracy, loss):
+        epochs_total = int(self.epoch_input.text())
+        progress = int((epoch / epochs_total) * 100)
+        
+        self.progress_bar.setValue(progress)
+        self.epoch_label.setText(f"Epoch: {epoch}/{epochs_total}")
+        self.accuracy_label.setText(f"Accuracy: {accuracy*100:.2f}%")
+        self.loss_label.setText(f"Loss: {loss:.4f}")
+        
+        self.epoch_data.append(epoch)
+        self.accuracy_data.append(accuracy)
+        self.loss_data.append(loss)
+        
+        # Update accuracy plot
+        self.accuracy_line.set_data(self.epoch_data, self.accuracy_data)
+        if len(self.epoch_data) > 0:
+            self.accuracy_ax.set_xlim(0, max(self.epoch_data))
+            self.accuracy_ax.set_ylim(0, max(self.accuracy_data) * 1.1)
+        self.accuracy_canvas.draw()
+        
+        # Update loss plot
+        self.loss_line.set_data(self.epoch_data, self.loss_data)
+        if len(self.epoch_data) > 0:
+            self.loss_ax.set_xlim(0, max(self.epoch_data))
+            self.loss_ax.set_ylim(0, max(self.loss_data) * 1.1)
+        self.loss_canvas.draw()
+        
+        # For demo purposes, generate random weights (in real app, get from Rust)
+        if epoch % 10 == 0:  # Update every 10 epochs for performance
+            weights = [
+                np.random.randn(5, 10) * 0.5,  # Input to Hidden1
+                np.random.randn(10, 10) * 0.5,  # Hidden1 to Hidden2
+                np.random.randn(10, 10) * 0.5,  # Hidden2 to Hidden3
+                np.random.randn(10, 3) * 0.5    # Hidden3 to Output
+            ]
+            self.nn_weights.append(weights)
+            
+            # Start animation if not already running
+            if len(self.nn_weights) > 1 and self.animation is None:
+                self.animation = animation.FuncAnimation(
+                    self.nn_figure, 
+                    self.animate_nn,
+                    frames=len(self.nn_weights),
+                    interval=200,
+                    blit=False,
+                    repeat=True
+                )
+                self.nn_canvas.draw()
+    
+    def training_finished(self, success, final_accuracy):
+        self.load_button.setEnabled(True)
+        self.train_button.setEnabled(True)
+        self.predict_button.setEnabled(True)
+        
+        # Stop animation when training completes
+        if self.animation is not None:
+            self.animation.event_source.stop()
+            self.animation = None
+            
+        if success:
+            self.progress_bar.setValue(100)
+            self.accuracy_label.setText(f"Final Accuracy: {final_accuracy*100:.2f}%")
+            QMessageBox.information(self, "Success", "Training completed successfully! Model saved to 'trained_model.bin'")
+            
+            if hasattr(self.training_thread, 'plot_path'):
+                self.display_final_plot(self.training_thread.plot_path)
+        else:
+            QMessageBox.critical(self, "Error", "Training failed. Check your data and parameters.")
+    
+    def predict(self):
+        # Ensure model exists
+        self.model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trained_model.bin")
+        if not os.path.exists(self.model_path):
+            QMessageBox.warning(self, "Warning", "No trained model found. Please train the model first.")
+            return
+        
+        try:
+            # Get input values
+            pm10 = float(self.pm10_input.text())
+            so2 = float(self.so2_input.text())
+            co = float(self.co_input.text())
+            o3 = float(self.o3_input.text())
+            no2 = float(self.no2_input.text())
+            
+            # Convert model path to bytes for Rust
+            model_path_bytes = self.model_path.encode('utf-8')
+            
+            # Call Rust prediction function
+            prediction_ptr = rust_lib.predict_air_quality(
+                c_double(pm10),
+                c_double(so2),
+                c_double(co),
+                c_double(o3),
+                c_double(no2),
+                model_path_bytes
+            )
+            
+            if not prediction_ptr:
+                QMessageBox.critical(self, "Error", "Prediction failed")
+                return
+                
+            prediction = prediction_ptr.contents
+            
+            # Get probabilities array
+            prob_array = np.ctypeslib.as_array(
+                prediction.probabilities,
+                shape=(prediction.probabilities_len,)
+            ).copy()
+            
+            # Apply softmax if not already applied in Rust
+            prob_array = np.exp(prob_array - np.max(prob_array))
+            prob_array = prob_array / prob_array.sum()
+            
+            # Determine category
+            category = "UNKNOWN"
+            predicted_class = prediction.predicted_class
+            
+            if predicted_class == 0:
+                category = "BAIK"
+            elif predicted_class == 1:
+                category = "SEDANG"
+            elif predicted_class == 2:
+                category = "TIDAK SEHAT"
+            else:
+                # Fallback to highest probability
+                predicted_class = np.argmax(prob_array)
+                if predicted_class == 0:
+                    category = "BAIK"
+                elif predicted_class == 1:
+                    category = "SEDANG"
+                elif predicted_class == 2:
+                    category = "TIDAK SEHAT"
+            
+            # Update UI
+            self.prediction_result.setText(f"Prediction: <b>{category}</b>")
+            self.probabilities_label.setText(
+                f"Probabilities: BAIK: {prob_array[0]*100:.1f}% | "
+                f"SEDANG: {prob_array[1]*100:.1f}% | "
+                f"TIDAK SEHAT: {prob_array[2]*100:.1f}%"
+            )
+            
+            # Free memory
+            rust_lib.free_prediction_result(prediction_ptr)
+            
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Please enter valid numbers for all input fields")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
